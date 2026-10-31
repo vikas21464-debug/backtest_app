@@ -2,7 +2,7 @@
 # Lumpsum + SWP Backtester  (3-bucket planner)  |  Streamlit + Plotly
 # - Pick 3 assets (mutual funds or NSE stocks) and an amount for each
 # - Custom start / end date, one lumpsum on day 1
-# - Optional monthly SWP with yearly step-up
+# - Optional monthly SWP with yearly step-up (step-up counted from the investment start date)
 # - Optional valuation profit booking: gains move from asset 3 to asset 2 on Sell signals
 #   (uses the same CMP / 124 DMA valuation signals as the Breakout & Valuation Analyzer)
 # Data: Yahoo Finance (stocks, split/dividend adjusted) and mfapi.in (AMFI mutual-fund NAV)
@@ -261,8 +261,10 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3)
 
     px         DataFrame (n x 3) of prices on a common calendar
     amounts    rupees invested in each asset on day 1
-    swp        monthly withdrawal in rupees (0 = none); step_up = yearly increase (fraction)
+    swp        monthly withdrawal in rupees at the investment START DATE (0 = none)
     delay      months after the start for the first withdrawal
+    step_up    yearly increase (fraction), counted from the investment start date, so the
+               first withdrawal after `delay` months is already inflated by (1+step_up)^(delay//12)
     allow      3 booleans: assets that may fund the SWP; mode: "sequential" or "proportional"
     pb_on      move gains of asset 3 into asset 2 when asset 3 shows a Sell signal (pb_pct: % of asset-3 value)
     """
@@ -319,7 +321,8 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3)
         # 2) SWP
         target, done = 0.0, np.zeros(3)
         if swp > 0 and k >= delay:
-            target = swp * (1.0 + step_up) ** ((k - delay) // 12)
+            # step-up is counted from the investment start date (month 0), not from the first withdrawal
+            target = swp * (1.0 + step_up) ** (k // 12)
             vals = units * p
             avail = np.where(allow_arr, vals, 0.0)
             tot = avail.sum()
@@ -472,11 +475,14 @@ with st.sidebar:
     end_date = st.date_input("End date", value=today, min_value=date(2000, 1, 1), max_value=today)
 
     st.subheader("Monthly SWP")
-    swp_amt = st.number_input("Monthly withdrawal (₹)", min_value=0, value=75000, step=5000,
-                              help="Set 0 to test a plain lumpsum with no withdrawals.")
-    swp_delay = st.number_input("First withdrawal after (months)", min_value=0, max_value=120, value=1, step=1)
+    swp_amt = st.number_input("Monthly withdrawal (₹, in start-date money)", min_value=0, value=75000, step=5000,
+                              help="Amount you need per month at the investment start date. It rises every 12 months "
+                                   "from that date, even before withdrawals begin. Set 0 for a plain lumpsum.")
+    swp_delay = st.number_input("First withdrawal after (months)", min_value=0, max_value=360, value=1, step=1,
+                                help="Withdrawals begin this many months after the start date, already adjusted "
+                                     "for inflation since the start.")
     step_pct = st.number_input("Yearly increase in withdrawal (%)", min_value=0.0, max_value=25.0, value=6.0, step=0.5,
-                               help="Raises the monthly amount every 12 months, for inflation.")
+                               help="Inflation step-up, applied every 12 months from the investment start date.")
     mode_label = st.radio("Withdraw from", ["In order: asset 1, then 2, then 3", "Proportional to value"],
                           help="'In order' empties asset 1 first, then asset 2, then asset 3, like the planner's "
                                "'use Bucket 1 and 2 first'.")
@@ -500,7 +506,7 @@ with st.sidebar:
 # ------------------------------------------------------------
 st.markdown('<div class="hero"><h1>Lumpsum & SWP Backtester</h1>'
             '<p>Invest once in up to three funds or stocks, then test monthly withdrawals over any period · '
-            'built for the 3-bucket plan</p></div>', unsafe_allow_html=True)
+            'built for the 3-bucket plan developed by Vikas Dhiman</p></div>', unsafe_allow_html=True)
 
 SLOTS = [
     ("Asset 1 · Income bucket", "Safety and regular withdrawals", "aditya birla sun life money manager", 52.5),
@@ -640,11 +646,14 @@ maxdd = float(((base["total"] / base["total"].cummax()) - 1).min() * 100)
 real_final = final / (1 + infl_pct / 100) ** years
 swp_on = swp_amt > 0
 
+# first withdrawal amount after the step-up counted from the investment start date
+first_wd = swp_amt * (1 + step_pct / 100) ** (int(swp_delay) // 12)
+
 k = st.columns(4)
 kpi(k[0], "Invested (lumpsum)", inr(invested), f"{idx[0]:%d %b %Y} to {idx[-1]:%d %b %Y} · {years:.1f} years")
 kpi(k[1], "Portfolio value at end", inr(final), f"≈ {inr(real_final)} in today's money" if final > 0 else "Fully withdrawn")
 kpi(k[2], "Total withdrawn", inr(withdrawn) if swp_on else "—",
-    f"{inr(swp_amt)} a month, +{step_pct:g}% a year" if swp_on else "SWP is off")
+    f"First: {inr(first_wd)}/month (month {int(swp_delay)}), +{step_pct:g}% a year" if swp_on else "SWP is off")
 kpi(k[3], "Wealth created", inr(final + withdrawn - invested),
     f"{(final + withdrawn) / invested:.2f}× the amount invested")
 st.write("")
