@@ -3,6 +3,7 @@
 # - Pick 3 assets (mutual funds or NSE stocks) and an amount for each
 # - Custom start / end date, one lumpsum on day 1
 # - Optional monthly SWP with yearly step-up (step-up counted from the investment start date)
+# - Optional refill of asset 1 from asset 2 whenever asset 1 is exhausted
 # - Optional valuation profit booking: gains move from asset 3 to asset 2 on Sell signals
 #   (uses the same CMP / 124 DMA valuation signals as the Breakout & Valuation Analyzer)
 # Data: Yahoo Finance (stocks, split/dividend adjusted) and mfapi.in (AMFI mutual-fund NAV)
@@ -256,7 +257,8 @@ def build_prices(series, start, end):
     return df, firsts
 
 
-def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3):
+def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3,
+             refill_on=False, refill_months=36):
     """Day-1 lumpsum, then monthly events (profit booking, SWP). Everything executes at that day's price.
 
     px         DataFrame (n x 3) of prices on a common calendar
@@ -267,6 +269,8 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3)
                first withdrawal after `delay` months is already inflated by (1+step_up)^(delay//12)
     allow      3 booleans: assets that may fund the SWP; mode: "sequential" or "proportional"
     pb_on      move gains of asset 3 into asset 2 when asset 3 shows a Sell signal (pb_pct: % of asset-3 value)
+    refill_on  when asset 1 can no longer pay the month's SWP in full (exhausted), top it up from asset 2 so that it
+               holds `refill_months` months of the current withdrawal (capped at what asset 2 has)
     """
     idx = px.index
     n = len(idx)
@@ -278,6 +282,7 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3)
     wd = np.zeros(n)
     withdrawn_by = np.zeros(3)
     booked_total = 0.0
+    refilled_total = 0.0
     depleted = None
     ledger = []
 
@@ -302,7 +307,7 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3)
         p = P[pos]
 
         # 1) valuation profit booking: asset 3 -> asset 2 (capped at the unrealised gain)
-        sig, booked = "", 0.0
+        sig, booked, refilled = "", 0.0, 0.0
         if pb_on and sig3 is not None and k > 0 and units[2] > 0:
             sig = signal_at(sig3, idx[pos])
             pct = pb_pct.get(sig, 0.0)
@@ -323,6 +328,20 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3)
         if swp > 0 and k >= delay:
             # step-up is counted from the investment start date (month 0), not from the first withdrawal
             target = swp * (1.0 + step_up) ** (k // 12)
+
+            # refill asset 1 from asset 2 when asset 1 cannot pay this month's SWP in full
+            if refill_on and allow_arr[0] and units[1] > 0 and units[0] * p[0] < target - 1.0:
+                v1, v2 = units[0] * p[0], units[1] * p[1]
+                amt = min(max(refill_months * target - v1, 0.0), v2)
+                if amt > 0:
+                    frac = amt / v2
+                    cost[1] *= (1 - frac)
+                    units[1] *= (1 - frac)
+                    units[0] += amt / p[0]
+                    cost[0] += amt
+                    refilled = amt
+                    refilled_total += amt
+
             vals = units * p
             avail = np.where(allow_arr, vals, 0.0)
             tot = avail.sum()
@@ -348,14 +367,15 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3)
 
         if swp > 0 or booked > 0:
             ledger.append({"Date": idx[pos], "Month": k, "Signal (asset 3)": sig, "Profit booked 3→2": booked,
-                           "SWP target": target, "SWP paid": done.sum(),
+                           "Refill 2→1": refilled, "SWP target": target, "SWP paid": done.sum(),
                            "From asset 1": done[0], "From asset 2": done[1], "From asset 3": done[2],
                            "Portfolio after": float((units * p).sum())})
     U[last:] = units
 
     values = pd.DataFrame(U * P, index=idx, columns=[0, 1, 2])
     return {"values": values, "total": values.sum(axis=1), "withdrawn": pd.Series(wd, index=idx),
-            "withdrawn_by": withdrawn_by, "booked_total": booked_total, "depleted": depleted,
+            "withdrawn_by": withdrawn_by, "booked_total": booked_total, "refilled_total": refilled_total,
+            "depleted": depleted,
             "ledger": pd.DataFrame(ledger), "units": units}
 
 
@@ -487,6 +507,16 @@ with st.sidebar:
                           help="'In order' empties asset 1 first, then asset 2, then asset 3, like the planner's "
                                "'use Bucket 1 and 2 first'.")
     allow = [st.checkbox(f"Asset {j + 1} can fund the SWP", value=True, key=f"allow{j}") for j in range(3)]
+
+    st.subheader("Bucket refill")
+    refill_on = st.checkbox("Refill asset 1 from asset 2 when asset 1 is exhausted", value=False,
+                            help="When asset 1 cannot pay the month's withdrawal in full, units of asset 2 are sold "
+                                 "and moved into asset 1, before that month's SWP is paid. Works best with "
+                                 "'In order' withdrawals.")
+    refill_months = st.number_input("Refill asset 1 up to (months of withdrawals)", min_value=1, max_value=120,
+                                    value=36, step=1, disabled=not refill_on,
+                                    help="Asset 1 is topped up to this many months of the current monthly withdrawal "
+                                         "(36 = 3 years). Limited to what asset 2 holds.")
 
     st.subheader("Valuation profit booking")
     pb_on = st.checkbox("Move gains from asset 3 to asset 2 on Sell signals", value=False,
@@ -625,7 +655,7 @@ if pb_on and sig3 is None:
 amounts = [s["amount"] for s in specs]
 mode = "sequential" if mode_label.startswith("In order") else "proportional"
 common = dict(delay=int(swp_delay), step_up=step_pct / 100.0, allow=allow, mode=mode,
-              pb_on=pb_on, pb_pct=pb_pct, sig3=sig3)
+              pb_on=pb_on, pb_pct=pb_pct, sig3=sig3, refill_on=refill_on, refill_months=int(refill_months))
 res = simulate(px, amounts, float(swp_amt), **common)
 base = simulate(px, amounts, 0.0, **common)          # same plan, no withdrawals
 
@@ -705,6 +735,8 @@ with tab2:
             "Value at end": st.column_config.NumberColumn(format="₹%.0f")})
         if pb_on:
             st.caption(f"Profit booking moved **{inr(res['booked_total'])}** from asset 3 into asset 2 over the period.")
+        if refill_on:
+            st.caption(f"Refills moved **{inr(res['refilled_total'])}** from asset 2 into asset 1 over the period.")
         st.caption("Price CAGR ignores withdrawals and profit booking. Stock prices are adjusted for splits and dividends; "
                    "mutual fund NAVs are growth-plan NAVs.")
 
@@ -727,7 +759,7 @@ with tab4:
         lg["Date"] = lg["Date"].dt.strftime("%d-%m-%Y")
         st.dataframe(lg, hide_index=True, use_container_width=True, column_config={
             c: st.column_config.NumberColumn(format="₹%.0f") for c in
-            ("Profit booked 3→2", "SWP target", "SWP paid", "From asset 1", "From asset 2", "From asset 3", "Portfolio after")})
+            ("Profit booked 3→2", "Refill 2→1", "SWP target", "SWP paid", "From asset 1", "From asset 2", "From asset 3", "Portfolio after")})
         st.caption("Every event runs at that day's closing price, on the first trading day on or after the monthly date.")
         st.download_button("Download withdrawal log (CSV)", lg.to_csv(index=False).encode(), "withdrawal_log.csv", "text/csv")
 
