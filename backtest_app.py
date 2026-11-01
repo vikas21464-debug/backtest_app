@@ -5,6 +5,7 @@
 # - Optional monthly SWP with yearly step-up (step-up counted from the investment start date)
 # - Optional refill of asset 1 from asset 2 whenever asset 1 is exhausted,
 #   and from asset 3 as well when asset 2 is also exhausted
+# - Optional refill of asset 2 from asset 3 (default 72 months of SWP) whenever asset 2 is exhausted
 # - Optional valuation profit booking: gains move from asset 3 to asset 2 on Sell signals
 #   (uses the same CMP / 124 DMA valuation signals as the Breakout & Valuation Analyzer)
 # Data: Yahoo Finance (stocks, split/dividend adjusted) and mfapi.in (AMFI mutual-fund NAV)
@@ -259,7 +260,8 @@ def build_prices(series, start, end):
 
 
 def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3,
-             refill_on=False, refill_months=36, refill3_on=False):
+             refill_on=False, refill_months=36, refill3_on=False,
+             refill23_on=False, refill23_months=72):
     """Day-1 lumpsum, then monthly events (profit booking, SWP). Everything executes at that day's price.
 
     px         DataFrame (n x 3) of prices on a common calendar
@@ -274,6 +276,8 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3,
                holds `refill_months` months of the current withdrawal (capped at what asset 2 has)
     refill3_on when asset 2 is also exhausted (it cannot cover the whole top-up), the remaining top-up is taken
                from asset 3 (capped at what asset 3 has). Only used together with refill_on.
+    refill23_on when asset 2 is exhausted (less than one month of SWP left), top it up from asset 3 so that it holds
+               `refill23_months` months of the current withdrawal (capped at what asset 3 has)
     """
     idx = px.index
     n = len(idx)
@@ -287,6 +291,7 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3,
     booked_total = 0.0
     refilled_total = 0.0
     refilled3_total = 0.0
+    refilled23_total = 0.0
     depleted = None
     ledger = []
 
@@ -304,6 +309,20 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3,
         k += 1
 
     allow_arr = np.asarray(allow, bool)
+
+    def move(src, dst, amt, p):
+        """Sell up to `amt` rupees of asset src at prices p and buy asset dst with it. Returns rupees moved."""
+        v = units[src] * p[src]
+        amt = min(amt, v)
+        if amt <= 0.0:
+            return 0.0
+        frac = amt / v
+        cost[src] *= (1 - frac)
+        units[src] *= (1 - frac)
+        units[dst] += amt / p[dst]
+        cost[dst] += amt
+        return amt
+
     last = 0
     for pos, k in events:
         U[last:pos] = units
@@ -311,7 +330,7 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3,
         p = P[pos]
 
         # 1) valuation profit booking: asset 3 -> asset 2 (capped at the unrealised gain)
-        sig, booked, refilled, refilled3 = "", 0.0, 0.0, 0.0
+        sig, booked, refilled, refilled3, refilled23 = "", 0.0, 0.0, 0.0, 0.0
         if pb_on and sig3 is not None and k > 0 and units[2] > 0:
             sig = signal_at(sig3, idx[pos])
             pct = pb_pct.get(sig, 0.0)
@@ -333,32 +352,29 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3,
             # step-up is counted from the investment start date (month 0), not from the first withdrawal
             target = swp * (1.0 + step_up) ** (k // 12)
 
-            # refill asset 1 when it cannot pay this month's SWP in full:
-            # first from asset 2, then (if asset 2 is exhausted too and refill3_on) from asset 3
-            if (refill_on and allow_arr[0] and units[0] * p[0] < target - 1.0
-                    and (units[1] > 0 or (refill3_on and units[2] > 0))):
-                need = max(refill_months * target - units[0] * p[0], 0.0)
-                v2 = units[1] * p[1]
-                from2 = min(need, v2)
-                if from2 > 0:
-                    frac = from2 / v2
-                    cost[1] *= (1 - frac)
-                    units[1] *= (1 - frac)
-                    units[0] += from2 / p[0]
-                    cost[0] += from2
-                    refilled = from2
-                    refilled_total += from2
-                rest = need - from2
-                v3 = units[2] * p[2]
-                if refill3_on and rest > 1.0 and v3 > 0:
-                    from3 = min(rest, v3)
-                    frac = from3 / v3
-                    cost[2] *= (1 - frac)
-                    units[2] *= (1 - frac)
-                    units[0] += from3 / p[0]
-                    cost[0] += from3
-                    refilled3 = from3
-                    refilled3_total += from3
+            # --- refills (all at today's prices) ---
+            # a) asset 1 cannot pay this month's SWP in full -> top it up from asset 2
+            # b) asset 2 is exhausted (< 1 month of SWP left) -> top it up from asset 3 to refill23_months of SWP,
+            #    then pass on to asset 1 whatever it still needs
+            # c) asset 1 still short and refill3_on -> take the rest straight from asset 3
+            tgt1 = refill_months * target
+            trig1 = refill_on and allow_arr[0] and units[0] * p[0] < target - 1.0
+            if trig1:
+                got = move(1, 0, max(tgt1 - units[0] * p[0], 0.0), p)
+                refilled += got
+                refilled_total += got
+            if refill23_on and units[1] * p[1] < target - 1.0 and units[2] > 0:
+                got = move(2, 1, max(refill23_months * target - units[1] * p[1], 0.0), p)
+                refilled23 += got
+                refilled23_total += got
+                if got > 0 and trig1:
+                    got = move(1, 0, max(tgt1 - units[0] * p[0], 0.0), p)
+                    refilled += got
+                    refilled_total += got
+            if trig1 and refill3_on and units[0] * p[0] < tgt1 - 1.0:
+                got = move(2, 0, max(tgt1 - units[0] * p[0], 0.0), p)
+                refilled3 += got
+                refilled3_total += got
 
             vals = units * p
             avail = np.where(allow_arr, vals, 0.0)
@@ -385,7 +401,7 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3,
 
         if swp > 0 or booked > 0:
             ledger.append({"Date": idx[pos], "Month": k, "Signal (asset 3)": sig, "Profit booked 3→2": booked,
-                           "Refill 2→1": refilled, "Refill 3→1": refilled3, "SWP target": target, "SWP paid": done.sum(),
+                           "Refill 2→1": refilled, "Refill 3→1": refilled3, "Refill 3→2": refilled23, "SWP target": target, "SWP paid": done.sum(),
                            "From asset 1": done[0], "From asset 2": done[1], "From asset 3": done[2],
                            "Portfolio after": float((units * p).sum())})
     U[last:] = units
@@ -393,7 +409,7 @@ def simulate(px, amounts, swp, delay, step_up, allow, mode, pb_on, pb_pct, sig3,
     values = pd.DataFrame(U * P, index=idx, columns=[0, 1, 2])
     return {"values": values, "total": values.sum(axis=1), "withdrawn": pd.Series(wd, index=idx),
             "withdrawn_by": withdrawn_by, "booked_total": booked_total, "refilled_total": refilled_total,
-            "refilled3_total": refilled3_total, "depleted": depleted,
+            "refilled3_total": refilled3_total, "refilled23_total": refilled23_total, "depleted": depleted,
             "ledger": pd.DataFrame(ledger), "units": units}
 
 
@@ -541,6 +557,14 @@ with st.sidebar:
                              help="If asset 2 cannot cover the whole top-up, the rest is sold from asset 3 and moved "
                                   "into asset 1. Needs the asset 2 refill above to be switched on.")
 
+    refill23_on = st.checkbox("Refill asset 2 from asset 3 when asset 2 is exhausted", value=False,
+                              help="When asset 2 has less than one month of withdrawal left, units of asset 3 are sold "
+                                   "and moved into asset 2. Works on its own or together with the asset 1 refill.")
+    refill23_months = st.number_input("Refill asset 2 up to (months of withdrawals)", min_value=1, max_value=240,
+                                      value=72, step=1, disabled=not refill23_on,
+                                      help="Asset 2 is topped up to this many months of the current monthly withdrawal "
+                                           "(72 = 6 years). Limited to what asset 3 holds.")
+
     st.subheader("Valuation profit booking")
     pb_on = st.checkbox("Move gains from asset 3 to asset 2 on Sell signals", value=False,
                         help="Each month, if asset 3's valuation signal (previous month's average CMP / 124 DMA) is a "
@@ -679,7 +703,8 @@ amounts = [s["amount"] for s in specs]
 mode = "sequential" if mode_label.startswith("In order") else "proportional"
 common = dict(delay=int(swp_delay), step_up=step_pct / 100.0, allow=allow, mode=mode,
               pb_on=pb_on, pb_pct=pb_pct, sig3=sig3, refill_on=refill_on, refill_months=int(refill_months),
-              refill3_on=bool(refill_on and refill3_on))
+              refill3_on=bool(refill_on and refill3_on),
+              refill23_on=bool(refill23_on), refill23_months=int(refill23_months))
 res = simulate(px, amounts, float(swp_amt), **common)
 base = simulate(px, amounts, 0.0, **common)          # same plan, no withdrawals
 
@@ -759,6 +784,8 @@ with tab2:
             "Value at end": st.column_config.NumberColumn(format="₹%.0f")})
         if pb_on:
             st.caption(f"Profit booking moved **{inr(res['booked_total'])}** from asset 3 into asset 2 over the period.")
+        if refill23_on:
+            st.caption(f"Refills moved **{inr(res['refilled23_total'])}** from asset 3 into asset 2 over the period.")
         if refill_on:
             st.caption(f"Refills moved **{inr(res['refilled_total'])}** from asset 2 into asset 1 over the period"
                        + (f" and **{inr(res['refilled3_total'])}** from asset 3." if refill3_on else "."))
@@ -784,7 +811,7 @@ with tab4:
         lg["Date"] = lg["Date"].dt.strftime("%d-%m-%Y")
         st.dataframe(lg, hide_index=True, use_container_width=True, column_config={
             c: st.column_config.NumberColumn(format="₹%.0f") for c in
-            ("Profit booked 3→2", "Refill 2→1", "Refill 3→1", "SWP target", "SWP paid", "From asset 1", "From asset 2", "From asset 3", "Portfolio after")})
+            ("Profit booked 3→2", "Refill 2→1", "Refill 3→1", "Refill 3→2", "SWP target", "SWP paid", "From asset 1", "From asset 2", "From asset 3", "Portfolio after")})
         st.caption("Every event runs at that day's closing price, on the first trading day on or after the monthly date.")
         st.download_button("Download withdrawal log (CSV)", lg.to_csv(index=False).encode(), "withdrawal_log.csv", "text/csv")
 
